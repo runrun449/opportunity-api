@@ -1,6 +1,7 @@
+# main.py
 import os
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 
 import requests
 from fastapi import FastAPI, Header, HTTPException
@@ -12,58 +13,66 @@ app = FastAPI(title="opportunity-api", version="0.4.0")
 # =========================================================
 # Auth (Admin/User key separation)
 # =========================================================
-# - GPT Actions is good at injecting header keys.
-# - We use X-API-KEY header for both admin and user access.
-# - Endpoints can require either ADMIN or USER key.
+# We use X-API-KEY header for both admin and user access.
 #
 # Env:
 #   ADMIN_API_KEY  : required for admin-only endpoints (customsearch proxy)
 #   USER_API_KEY   : required for user endpoints (suggest_fetch, etc.)
+#   GOOGLE_CSE_API_KEY     : required for customsearch proxy
+#   GOOGLE_CSE_DEFAULT_CX  : optional default cx
 # =========================================================
 
 HEADER_NAME = "X-API-KEY"
 
 
-def _get_env(name: str) -> str:
+def _get_env_optional(name: str) -> Optional[str]:
+    v = os.getenv(name)
+    if not v:
+        return None
+    return v
+
+
+def _get_env_required(name: str) -> str:
     v = os.getenv(name)
     if not v:
         raise HTTPException(status_code=500, detail=f"{name} is not set")
     return v
 
 
-def _is_valid_key(x_api_key: Optional[str], expected: str) -> bool:
-    return bool(x_api_key) and x_api_key == expected
+def _is_valid_key(x_api_key: Optional[str], expected: Optional[str]) -> bool:
+    return bool(x_api_key) and bool(expected) and x_api_key == expected
 
 
 def require_admin_key(x_api_key: Optional[str]) -> None:
-    expected = _get_env("ADMIN_API_KEY")
+    expected = _get_env_required("ADMIN_API_KEY")
     if not _is_valid_key(x_api_key, expected):
         raise HTTPException(status_code=401, detail="Invalid admin API key")
 
 
 def require_user_key(x_api_key: Optional[str]) -> None:
-    expected = _get_env("USER_API_KEY")
+    expected = _get_env_required("USER_API_KEY")
     if not _is_valid_key(x_api_key, expected):
         raise HTTPException(status_code=401, detail="Invalid user API key")
 
 
-def require_any_key(x_api_key: Optional[str]) -> str:
+def identify_role_by_key(x_api_key: Optional[str]) -> Literal["admin", "user", "none", "invalid"]:
     """
-    Accept either admin or user key.
-    Returns role: "admin" or "user"
+    Identify role WITHOUT throwing 500 when env is missing.
+    - admin/user: key matches env
+    - none: no key provided
+    - invalid: key provided but doesn't match (or env not set)
     """
-    admin = os.getenv("ADMIN_API_KEY")
-    user = os.getenv("USER_API_KEY")
-    if not admin:
-        raise HTTPException(status_code=500, detail="ADMIN_API_KEY is not set")
-    if not user:
-        raise HTTPException(status_code=500, detail="USER_API_KEY is not set")
+    if not x_api_key:
+        return "none"
+
+    admin = _get_env_optional("ADMIN_API_KEY")
+    user = _get_env_optional("USER_API_KEY")
 
     if _is_valid_key(x_api_key, admin):
         return "admin"
     if _is_valid_key(x_api_key, user):
         return "user"
-    raise HTTPException(status_code=401, detail="Invalid API key")
+    return "invalid"
 
 
 # =========================================================
@@ -71,7 +80,7 @@ def require_any_key(x_api_key: Optional[str]) -> str:
 # =========================================================
 def fetch_google_suggest(seed: str, hl: str = "ja", timeout: float = 6.0) -> List[str]:
     """
-    Google Suggest (unofficial) endpoint.
+    Google Suggest (unofficial).
     Returns a list of suggestion strings.
     """
     url = "https://suggestqueries.google.com/complete/search"
@@ -113,9 +122,7 @@ class CustomSearchProxyRequest(BaseModel):
 
 
 def _require_google_cse_key() -> str:
-    key = os.getenv("GOOGLE_CSE_API_KEY")
-    if not key:
-        raise HTTPException(status_code=500, detail="GOOGLE_CSE_API_KEY is not set")
+    key = _get_env_required("GOOGLE_CSE_API_KEY")
     return key
 
 
@@ -135,7 +142,7 @@ def _shape_cse_response(raw: Dict[str, Any], req: CustomSearchProxyRequest, cx_u
         total_results = 0
 
     items = raw.get("items") or []
-    shaped_items = []
+    shaped_items: List[Dict[str, Any]] = []
     for it in items:
         shaped_items.append(
             {
@@ -169,17 +176,26 @@ def _shape_cse_response(raw: Dict[str, Any], req: CustomSearchProxyRequest, cx_u
 # =========================================================
 @app.get("/healthz")
 def healthz():
+    # No auth. Must always be callable for probes.
     return {"ok": True, "service": "opportunity-api", "version": "0.4.0"}
 
 
 @app.get("/whoami")
 def whoami(x_api_key: Optional[str] = Header(default=None, alias=HEADER_NAME)):
     """
-    Debug endpoint: identifies whether the provided key is admin/user.
-    (Safe to keep; remove if you don't want it.)
+    Debug endpoint:
+    - NEVER 500 just because env is missing (so you can verify deployment state)
+    - Shows whether env keys are set, and whether provided key matches admin/user.
     """
-    role = require_any_key(x_api_key)
-    return {"role": role}
+    admin_set = bool(os.getenv("ADMIN_API_KEY"))
+    user_set = bool(os.getenv("USER_API_KEY"))
+    role = identify_role_by_key(x_api_key)
+
+    return {
+        "admin_api_key_set": admin_set,
+        "user_api_key_set": user_set,
+        "role": role,  # admin | user | none | invalid
+    }
 
 
 @app.get("/suggest_fetch")
@@ -201,6 +217,7 @@ def suggest_fetch(
             suggestions = suggestions[: min(limit, 50)]
         payload = {"seed": seed, "suggestions": suggestions, "source": "google_suggest"}
         return JSONResponse(payload)
+
     except requests.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Suggest upstream HTTP error: {e}")
     except requests.RequestException as e:
@@ -224,7 +241,7 @@ def customsearch_proxy(
     google_key = _require_google_cse_key()
     cx_used = _resolve_cx(body.cx)
 
-    params = {
+    params: Dict[str, Any] = {
         "key": google_key,
         "cx": cx_used,
         "q": body.q,
@@ -256,7 +273,6 @@ def customsearch_proxy(
         except Exception:
             j = {"message": r.text}
 
-        # Keep error readable and actionable for admin debugging
         raise HTTPException(
             status_code=502,
             detail={
